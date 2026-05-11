@@ -4,182 +4,155 @@ declare(strict_types=1);
 
 namespace Phalanx\Styx;
 
-use Phalanx\Stream\Contract\StreamContext;
-use Phalanx\Stream\Contract\StreamSource;
-use Phalanx\Stream\Contract\Streamable;
-use Evenement\EventEmitterInterface;
+use Closure;
 use Generator;
-use React\EventLoop\Loop;
-use React\Stream\ReadableStreamInterface;
+use Phalanx\Cancellation\Cancelled;
+use Phalanx\Scope\ExecutionScope;
+use Phalanx\Scope\Stream\Streamable;
+use Phalanx\Scope\Stream\StreamSource;
+use Phalanx\Styx\Terminal\Collect;
+use Phalanx\Styx\Terminal\Drain;
+use Phalanx\Styx\Terminal\First;
+use Phalanx\Styx\Terminal\Reduce;
+use Phalanx\Supervisor\TaskRun;
+use Throwable;
 
-use function React\Async\async;
-
+/**
+ * @implements StreamSource<mixed>
+ */
 final class Emitter implements StreamSource
 {
-    use Streamable {
-        onDispose as private traitOnDispose;
-    }
+    use Streamable;
 
-    /** @var callable(Channel, StreamContext): void */
-    private $setup;
+    /** @var Closure(Channel, ExecutionScope): (?Closure) */
+    private readonly Closure $setup;
 
-    private function __construct(callable $setup)
+    /** @param Closure(Channel, ExecutionScope): (?Closure) $setup */
+    private function __construct(Closure $setup)
     {
         $this->setup = $setup;
         $this->initStreamState();
     }
 
-    public static function stream(ReadableStreamInterface|callable $source): self
+    /** @param Closure(Channel, ExecutionScope): void $producer */
+    public static function produce(Closure $producer): self
     {
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($source): void {
-            $stream = is_callable($source) ? $source() : $source;
-
-            $ch->withPressure(static function (bool $pause) use ($stream): void {
-                $pause ? $stream->pause() : $stream->resume();
-            });
-
-            $stream->on('data', static function (mixed $data) use ($ch): void {
-                $ch->emit($data);
-            });
-
-            $stream->on('end', static function () use ($ch): void {
-                $ch->complete();
-            });
-
-            $stream->on('error', static function (\Throwable $e) use ($ch): void {
-                $ch->error($e);
-            });
-
-            $stream->on('close', static function () use ($ch): void {
-                $ch->complete();
-            });
-
-            $ctx->onDispose(static function () use ($stream): void {
-                if ($stream->isReadable()) {
-                    $stream->close();
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($producer): Closure {
+            $run = $scope->go(static function (ExecutionScope $producerScope) use ($producer, $ch): void {
+                try {
+                    $producer($ch, $producerScope);
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
+                    $ch->error($e);
+                    return;
                 }
-            });
-        });
-    }
-
-    public static function listen(string $event, EventEmitterInterface|callable $source): self
-    {
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($event, $source): void {
-            /** @var EventEmitterInterface $emitter */
-            $emitter = is_callable($source) ? $source() : $source;
-
-            $emitter->on($event, static function (mixed ...$args) use ($ch): void {
-                $ch->emit(...$args);
-            });
-
-            $emitter->on('error', static function (\Throwable $e) use ($ch): void {
-                $ch->error($e);
-            });
-
-            $emitter->on('close', static function () use ($ch): void {
                 $ch->complete();
-            });
+            }, 'styx.produce');
 
-            if (method_exists($emitter, 'close')) {
-                $ctx->onDispose(static function () use ($emitter): void {
-                    $emitter->close();
-                });
-            }
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
     public static function interval(float $seconds): self
     {
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($seconds): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($seconds): Closure {
             $tick = 0;
-            $timer = Loop::addPeriodicTimer($seconds, static function () use ($ch, &$tick): void {
+            $subscription = $scope->periodic($seconds, static function () use ($ch, &$tick): void {
                 $ch->emit(++$tick);
             });
 
-            $ctx->onDispose(static function () use ($timer, $ch): void {
-                Loop::cancelTimer($timer);
+            if ($subscription->cancelled) {
                 $ch->complete();
-            });
+            }
+
+            return static function () use ($subscription, $ch): void {
+                $subscription->cancel();
+                $ch->complete();
+            };
         });
     }
 
-    /** @param callable(Channel, StreamContext): void $producer */
-    public static function produce(callable $producer): self
-    {
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($producer): void {
-            async(static function () use ($producer, $ch, $ctx): void {
-                try {
-                    $producer($ch, $ctx);
-                } catch (\Throwable $e) {
-                    $ch->error($e);
-                } finally {
-                    $ch->complete();
-                }
-            })();
-        });
-    }
-
-    public function __invoke(StreamContext $context): Generator
+    public function __invoke(ExecutionScope $scope): Generator
     {
         $channel = new Channel();
-        ($this->setup)($channel, $context);
-
-        $this->fireOnStart($context);
+        $cleanup = null;
 
         try {
+            $cleanup = ($this->setup)($channel, $scope);
+            $this->fireOnStart($scope);
+
             foreach ($channel->consume() as $value) {
-                $context->throwIfCancelled();
-                $this->fireOnEach($value, $context);
+                $scope->throwIfCancelled();
+                $this->fireOnEach($value, $scope);
                 yield $value;
             }
-            $this->fireOnComplete($context);
-        } catch (\Throwable $e) {
-            $this->fireOnError($e, $context);
+            $this->fireOnComplete($scope);
+        } catch (Throwable $e) {
+            $this->fireOnError($e, $scope);
             throw $e;
         } finally {
-            $this->fireOnDispose($context);
+            if ($cleanup instanceof Closure) {
+                $cleanup();
+            }
+            $channel->complete();
+            $this->fireOnDispose($scope);
         }
     }
 
-    /** @param callable(mixed): mixed $fn */
-    public function map(callable $fn): self
+    /** @param Closure(mixed, int): mixed $fn */
+    public function map(Closure $fn): self
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $fn): void {
-            async(static function () use ($prev, $ch, $ctx, $fn): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $fn): Closure {
+            $run = $scope->go(static function (ExecutionScope $childScope) use ($prev, $ch, $fn): void {
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
-                        $ch->emit($fn($value));
+                    foreach ($prev($childScope) as $key => $value) {
+                        $childScope->throwIfCancelled();
+                        $ch->emit($fn($value, $key));
                     }
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.map');
+
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
-    /** @param callable(mixed): bool $predicate */
-    public function filter(callable $predicate): self
+    /** @param Closure(mixed, int): bool $predicate */
+    public function filter(Closure $predicate): self
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $predicate): void {
-            async(static function () use ($prev, $ch, $ctx, $predicate): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $predicate): Closure {
+            $run = $scope->go(static function (ExecutionScope $childScope) use ($prev, $ch, $predicate): void {
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
-                        if ($predicate($value)) {
+                    foreach ($prev($childScope) as $key => $value) {
+                        $childScope->throwIfCancelled();
+                        if ($predicate($value, $key)) {
                             $ch->emit($value);
                         }
                     }
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.filter');
+
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
@@ -187,22 +160,28 @@ final class Emitter implements StreamSource
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $n): void {
-            async(static function () use ($prev, $ch, $ctx, $n): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $n): Closure {
+            $run = $scope->go(static function (ExecutionScope $childScope) use ($prev, $ch, $n): void {
                 try {
                     $count = 0;
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
                         $ch->emit($value);
                         if (++$count >= $n) {
                             break;
                         }
                     }
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.take');
+
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
@@ -210,25 +189,31 @@ final class Emitter implements StreamSource
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $seconds): void {
-            async(static function () use ($prev, $ch, $ctx, $seconds): void {
-                $lastEmit = 0.0;
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $seconds): Closure {
+            $run = $scope->go(static function (ExecutionScope $childScope) use ($prev, $ch, $seconds): void {
+                $lastEmitNs = 0.0;
                 $intervalNs = $seconds * 1e9;
 
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
                         $now = (float) hrtime(true);
-                        if (($now - $lastEmit) >= $intervalNs) {
+                        if (($now - $lastEmitNs) >= $intervalNs) {
                             $ch->emit($value);
-                            $lastEmit = $now;
+                            $lastEmitNs = $now;
                         }
                     }
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.throttle');
+
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
@@ -236,47 +221,63 @@ final class Emitter implements StreamSource
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $seconds): void {
-            async(static function () use ($prev, $ch, $ctx, $seconds): void {
-                $timer = null;
-                $lastValue = null;
-                $hasValue = false;
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $seconds): Closure {
+            $delaySeconds = max(0.001, $seconds);
+            /** @var TaskRun|null $timerRun */
+            $timerRun = null;
+            $producerRun = $scope->go(static function (ExecutionScope $childScope) use (
+                $prev,
+                $ch,
+                $delaySeconds,
+                &$timerRun,
+            ): void {
+                $latest = null;
+                $hasLatest = false;
+                $version = 0;
 
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
+                        $timerRun?->cancellation->cancel();
+                        $latest = $value;
+                        $hasLatest = true;
+                        $version++;
 
-                        if ($timer !== null) {
-                            Loop::cancelTimer($timer);
-                        }
-
-                        $lastValue = $value;
-                        $hasValue = true;
-
-                        $timer = Loop::addTimer($seconds, static function () use ($ch, &$lastValue, &$hasValue): void {
-                            if ($hasValue) {
-                                $ch->emit($lastValue);
-                                $hasValue = false;
+                        $currentVersion = $version;
+                        $timerRun = $childScope->go(static function (ExecutionScope $timerScope) use (
+                            $ch,
+                            $delaySeconds,
+                            $currentVersion,
+                            &$latest,
+                            &$hasLatest,
+                            &$version,
+                        ): void {
+                            $timerScope->delay($delaySeconds);
+                            if ($hasLatest && $version === $currentVersion) {
+                                $ch->emit($latest);
+                                $hasLatest = false;
                             }
-                        });
+                        }, 'styx.debounce.timer');
                     }
 
-                    if ($hasValue) {
-                        $ch->emit($lastValue);
+                    $timerRun?->cancellation->cancel();
+                    if ($hasLatest) {
+                        $ch->emit($latest);
                     }
-
-                    if ($timer !== null) {
-                        Loop::cancelTimer($timer);
-                    }
-
                     $ch->complete();
-                } catch (\Throwable $e) {
-                    if ($timer !== null) {
-                        Loop::cancelTimer($timer);
-                    }
+                } catch (Cancelled $e) {
+                    $timerRun?->cancellation->cancel();
+                    throw $e;
+                } catch (Throwable $e) {
+                    $timerRun?->cancellation->cancel();
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.debounce');
+
+            return static function () use ($producerRun, &$timerRun): void {
+                $timerRun?->cancellation->cancel();
+                $producerRun->cancellation->cancel();
+            };
         });
     }
 
@@ -284,33 +285,50 @@ final class Emitter implements StreamSource
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $count, $seconds): void {
-            async(static function () use ($prev, $ch, $ctx, $count, $seconds): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $count, $seconds): Closure {
+            $delaySeconds = max(0.001, $seconds);
+            /** @var TaskRun|null $timerRun */
+            $timerRun = null;
+            $producerRun = $scope->go(static function (ExecutionScope $childScope) use (
+                $prev,
+                $ch,
+                $count,
+                $delaySeconds,
+                &$timerRun,
+            ): void {
                 /** @var list<mixed> $buffer */
                 $buffer = [];
-                /** @var \React\EventLoop\TimerInterface|null $timer */
-                $timer = null;
+                $version = 0;
 
-                $flush = static function () use ($ch, &$buffer, &$timer): void {
+                $flush = static function () use ($ch, &$buffer, &$timerRun, &$version): void {
                     if ($buffer !== []) {
-                        $ch->emit($buffer);
+                        $batch = $buffer;
                         $buffer = [];
+                        $ch->emit($batch);
                     }
-                    if ($timer !== null) {
-                        Loop::cancelTimer($timer);
-                        $timer = null;
-                    }
+                    $timerRun?->cancellation->cancel();
+                    $timerRun = null;
+                    $version++;
                 };
 
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
                         $buffer[] = $value;
 
-                        if ($timer === null) {
-                            $timer = Loop::addTimer($seconds, static function () use ($flush): void {
-                                $flush();
-                            });
+                        if ($timerRun === null) {
+                            $currentVersion = $version;
+                            $timerRun = $childScope->go(static function (ExecutionScope $timerScope) use (
+                                $delaySeconds,
+                                $flush,
+                                $currentVersion,
+                                &$version,
+                            ): void {
+                                $timerScope->delay($delaySeconds);
+                                if ($version === $currentVersion) {
+                                    $flush();
+                                }
+                            }, 'styx.buffer_window.timer');
                         }
 
                         if (count($buffer) >= $count) {
@@ -320,13 +338,19 @@ final class Emitter implements StreamSource
 
                     $flush();
                     $ch->complete();
-                } catch (\Throwable $e) {
-                    if ($timer !== null) {
-                        Loop::cancelTimer($timer);
-                    }
+                } catch (Cancelled $e) {
+                    $timerRun?->cancellation->cancel();
+                    throw $e;
+                } catch (Throwable $e) {
+                    $timerRun?->cancellation->cancel();
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.buffer_window');
+
+            return static function () use ($producerRun, &$timerRun): void {
+                $timerRun?->cancellation->cancel();
+                $producerRun->cancellation->cancel();
+            };
         });
     }
 
@@ -334,21 +358,32 @@ final class Emitter implements StreamSource
     {
         $sources = [$this, ...$others];
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($sources): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($sources): Closure {
             $remaining = count($sources);
             $failed = false;
+            $completed = false;
+            /** @var list<TaskRun> $runs */
+            $runs = [];
 
             foreach ($sources as $source) {
-                async(static function () use ($source, $ch, $ctx, &$remaining, &$failed): void {
+                $runs[] = $scope->go(static function (ExecutionScope $childScope) use (
+                    $source,
+                    $ch,
+                    &$remaining,
+                    &$failed,
+                    &$completed,
+                ): void {
                     try {
-                        foreach ($source($ctx) as $value) {
-                            $ctx->throwIfCancelled();
+                        foreach ($source($childScope) as $value) {
+                            $childScope->throwIfCancelled();
                             if ($failed) {
                                 return;
                             }
                             $ch->emit($value);
                         }
-                    } catch (\Throwable $e) {
+                    } catch (Cancelled $e) {
+                        throw $e;
+                    } catch (Throwable $e) {
                         if (!$failed) {
                             $failed = true;
                             $ch->error($e);
@@ -357,11 +392,18 @@ final class Emitter implements StreamSource
                     }
 
                     $remaining--;
-                    if ($remaining <= 0 && !$failed) {
+                    if ($remaining <= 0 && !$failed && !$completed) {
+                        $completed = true;
                         $ch->complete();
                     }
-                })();
+                }, 'styx.merge');
             }
+
+            return static function () use (&$runs): void {
+                foreach ($runs as $run) {
+                    $run->cancellation->cancel();
+                }
+            };
         });
     }
 
@@ -369,14 +411,14 @@ final class Emitter implements StreamSource
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev): void {
-            async(static function () use ($prev, $ch, $ctx): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev): Closure {
+            $run = $scope->go(static function (ExecutionScope $childScope) use ($prev, $ch): void {
                 $hasLast = false;
                 $lastValue = null;
 
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
                         if (!$hasLast || $value !== $lastValue) {
                             $ch->emit($value);
                             $lastValue = $value;
@@ -384,26 +426,32 @@ final class Emitter implements StreamSource
                         }
                     }
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.distinct');
+
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
-    /** @param callable(mixed): mixed $keyFn */
-    public function distinctBy(callable $keyFn): self
+    /** @param Closure(mixed): mixed $keyFn */
+    public function distinctBy(Closure $keyFn): self
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $keyFn): void {
-            async(static function () use ($prev, $ch, $ctx, $keyFn): void {
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $keyFn): Closure {
+            $run = $scope->go(static function (ExecutionScope $childScope) use ($prev, $ch, $keyFn): void {
                 $hasLastKey = false;
                 $lastKey = null;
 
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
                         $key = $keyFn($value);
                         if (!$hasLastKey || $key !== $lastKey) {
                             $ch->emit($value);
@@ -412,10 +460,16 @@ final class Emitter implements StreamSource
                         }
                     }
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    throw $e;
+                } catch (Throwable $e) {
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.distinct_by');
+
+            return static function () use ($run): void {
+                $run->cancellation->cancel();
+            };
         });
     }
 
@@ -423,55 +477,67 @@ final class Emitter implements StreamSource
     {
         $prev = $this;
 
-        return new self(static function (Channel $ch, StreamContext $ctx) use ($prev, $seconds): void {
-            $latest = null;
-            /** @var bool $hasLatest */
-            $hasLatest = false;
+        return new self(static function (Channel $ch, ExecutionScope $scope) use ($prev, $seconds): Closure {
+            $state = new class () {
+                public mixed $latest = null;
+                public bool $hasLatest = false;
+            };
 
-            $timer = Loop::addPeriodicTimer($seconds, static function () use ($ch, &$latest, &$hasLatest): void {
-                if ($hasLatest) {
-                    $ch->emit($latest);
-                    $hasLatest = false;
+            $subscription = $scope->periodic($seconds, static function () use ($ch, $state): void {
+                if ($state->hasLatest) {
+                    $ch->emit($state->latest);
+                    $state->hasLatest = false;
                 }
             });
 
-            $ctx->onDispose(static function () use ($timer): void {
-                Loop::cancelTimer($timer);
-            });
-
-            async(static function () use ($prev, $ch, $ctx, &$latest, &$hasLatest): void {
+            $run = $scope->go(static function (ExecutionScope $childScope) use (
+                $prev,
+                $ch,
+                $state,
+                $subscription,
+            ): void {
                 try {
-                    foreach ($prev($ctx) as $value) {
-                        $ctx->throwIfCancelled();
-                        $latest = $value;
-                        $hasLatest = true;
+                    foreach ($prev($childScope) as $value) {
+                        $childScope->throwIfCancelled();
+                        $state->latest = $value;
+                        $state->hasLatest = true;
                     }
-
+                    $subscription->cancel();
                     $ch->complete();
-                } catch (\Throwable $e) {
+                } catch (Cancelled $e) {
+                    $subscription->cancel();
+                    throw $e;
+                } catch (Throwable $e) {
+                    $subscription->cancel();
                     $ch->error($e);
                 }
-            })();
+            }, 'styx.sample');
+
+            return static function () use ($run, $subscription): void {
+                $subscription->cancel();
+                $run->cancellation->cancel();
+            };
         });
     }
 
-    public function toArray(): \Phalanx\Stream\Terminal\Collect
+    public function toArray(): Collect
     {
-        return new \Phalanx\Stream\Terminal\Collect($this);
+        return new Collect($this);
     }
 
-    public function reduce(callable $fn, mixed $initial = null): \Phalanx\Stream\Terminal\Reduce
+    /** @param Closure(mixed, mixed): mixed $fn */
+    public function reduce(Closure $fn, mixed $initial = null): Reduce
     {
-        return new \Phalanx\Stream\Terminal\Reduce($this, $fn, $initial);
+        return new Reduce($this, $fn, $initial);
     }
 
-    public function first(): \Phalanx\Stream\Terminal\First
+    public function first(): First
     {
-        return new \Phalanx\Stream\Terminal\First($this);
+        return new First($this);
     }
 
-    public function consume(): \Phalanx\Stream\Terminal\Drain
+    public function consume(): Drain
     {
-        return new \Phalanx\Stream\Terminal\Drain($this);
+        return new Drain($this);
     }
 }
